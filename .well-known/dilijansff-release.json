@@ -1,10 +1,10 @@
 {
   "artifactVersion": 1,
   "repository": "dilijansff/dilijansff-source",
-  "requestId": "manual-pr-52",
+  "requestId": "manual-pr-53",
   "releaseKind": "reviewed-main",
   "releaseRef": "refs/heads/main",
-  "releaseSha": "f684cbb066c3b30e253a09301049851adef5389b",
-  "trustedMainSha": "f684cbb066c3b30e253a09301049851adef5389b",
+  "releaseSha": "0fbd0174dd5c1bdc994fb5b2f042328821303e7e",
+  "trustedMainSha": "0fbd0174dd5c1bdc994fb5b2f042328821303e7e",
   "payloadSha256": "05c25517db125ff6c4a03209d4eda59a8c39d9117cdb55332d6a9770d7b787d2"
 }
