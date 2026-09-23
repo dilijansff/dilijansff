@@ -1,47 +1,78 @@
 name: Cleanup completed Pages artifact
 
 on:
-  workflow_run:
-    workflows:
-      - pages build and deployment
-    types:
-      - completed
+  push:
+    branches:
+      - main
 
 permissions: {}
 
 jobs:
   cleanup:
-    if: >-
-      github.event.workflow_run.conclusion == 'success' &&
-      github.event.workflow_run.event == 'dynamic' &&
-      github.event.workflow_run.head_branch == 'main'
+    if: github.repository == 'dilijansff/dilijansff'
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 12
     permissions:
       actions: write
 
     steps:
-      - name: Delete only the completed Pages run artifact
+      - name: Wait for this commit's Pages run and delete only its artifact
         env:
           GH_TOKEN: ${{ github.token }}
-          PAGES_RUN_ID: ${{ github.event.workflow_run.id }}
-          PAGES_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          PAGES_HEAD_SHA: ${{ github.sha }}
         shell: bash
         run: |
           set -euo pipefail
           [[ "${GITHUB_REPOSITORY}" == 'dilijansff/dilijansff' ]]
-          [[ "${PAGES_RUN_ID}" =~ ^[1-9][0-9]*$ ]]
           [[ "${PAGES_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]
+
+          deadline=$((SECONDS + 600))
+          pages_run_id=''
+          pages_completed='false'
+          while (( SECONDS < deadline )); do
+            workflow_runs="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?branch=main&event=dynamic&per_page=100")"
+            matching_runs="$(jq -c --arg sha "${PAGES_HEAD_SHA}" '
+              [.workflow_runs[]
+                | select(.name == "pages build and deployment")
+                | select(.event == "dynamic")
+                | select(.head_branch == "main")
+                | select(.head_sha == $sha)]
+            ' <<< "${workflow_runs}")"
+            matching_count="$(jq -r 'length' <<< "${matching_runs}")"
+            [[ "${matching_count}" =~ ^[0-9]+$ ]]
+            if (( matching_count > 1 )); then
+              echo 'More than one Pages run matched the exact public commit.' >&2
+              exit 1
+            fi
+            if (( matching_count == 1 )); then
+              pages_run_id="$(jq -r '.[0].id' <<< "${matching_runs}")"
+              pages_status="$(jq -r '.[0].status' <<< "${matching_runs}")"
+              pages_conclusion="$(jq -r '.[0].conclusion // ""' <<< "${matching_runs}")"
+              [[ "${pages_run_id}" =~ ^[1-9][0-9]*$ ]]
+              if [[ "${pages_status}" == 'completed' ]]; then
+                [[ "${pages_conclusion}" == 'success' ]]
+                pages_completed='true'
+                break
+              fi
+            fi
+            sleep 10
+          done
+          [[ "${pages_run_id}" =~ ^[1-9][0-9]*$ ]]
+          [[ "${pages_completed}" == 'true' ]]
+
           artifacts="$(gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${PAGES_RUN_ID}/artifacts?per_page=100")"
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${pages_run_id}/artifacts?per_page=100")"
           artifact_count="$(jq -r '[.artifacts[] | select(.name == "github-pages")] | length' <<< "${artifacts}")"
           [[ "${artifact_count}" == '1' ]]
-          artifact_id="$(jq -r --arg sha "${PAGES_HEAD_SHA}" '
+          artifact_id="$(jq -r --arg sha "${PAGES_HEAD_SHA}" --argjson run_id "${pages_run_id}" '
             .artifacts[]
             | select(.name == "github-pages")
-            | select(.workflow_run.id == (env.PAGES_RUN_ID | tonumber))
+            | select(.workflow_run.id == $run_id)
             | select(.workflow_run.head_sha == $sha)
             | .id
           ' <<< "${artifacts}")"
@@ -53,6 +84,6 @@ jobs:
           remaining="$(gh api \
             -H 'Accept: application/vnd.github+json' \
             -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${PAGES_RUN_ID}/artifacts?per_page=100" \
+            "repos/${GITHUB_REPOSITORY}/actions/runs/${pages_run_id}/artifacts?per_page=100" \
             --jq '[.artifacts[] | select(.name == "github-pages")] | length')"
           [[ "${remaining}" == '0' ]]
