@@ -1,0 +1,215 @@
+name: Verify exact live production
+
+on:
+  push:
+    branches:
+      - main
+
+permissions: {}
+
+concurrency:
+  group: dilijansff-public-production-verification
+  cancel-in-progress: false
+
+jobs:
+  verify-live:
+    if: github.repository == 'dilijansff/dilijansff'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    permissions:
+      actions: read
+      contents: read
+
+    steps:
+      - name: Check out the exact published commit without credentials
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Validate the committed release identity and payload hash
+        id: release
+        env:
+          PUBLIC_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${GITHUB_REPOSITORY}" == 'dilijansff/dilijansff' ]]
+          [[ "${GITHUB_REF}" == 'refs/heads/main' ]]
+          [[ "${PUBLIC_SHA}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git rev-parse HEAD^{commit})" == "${PUBLIC_SHA}" ]]
+          remote_main="$(git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | awk '{print $1}')"
+          [[ "${remote_main}" == "${PUBLIC_SHA}" ]]
+
+          marker='.well-known/dilijansff-release.json'
+          test -f "${marker}"
+          test -f index.html
+          test -f fulfillment-fbs/index.html
+          test "$(cat CNAME)" = 'dilijansff.ru'
+          jq -e '
+            keys == [
+              "artifactVersion", "payloadSha256", "releaseKind", "releaseRef",
+              "releaseSha", "repository", "requestId", "trustedMainSha"
+            ]
+            and .artifactVersion == 1
+            and .repository == "dilijansff/dilijansff-source"
+            and (.payloadSha256 | test("^[0-9a-f]{64}$"))
+            and (.releaseSha | test("^[0-9a-f]{40}$"))
+            and (.trustedMainSha | test("^[0-9a-f]{40}$"))
+          ' "${marker}" >/dev/null
+
+          release_kind="$(jq -r '.releaseKind' "${marker}")"
+          release_ref="$(jq -r '.releaseRef' "${marker}")"
+          release_sha="$(jq -r '.releaseSha' "${marker}")"
+          trusted_main_sha="$(jq -r '.trustedMainSha' "${marker}")"
+          request_id="$(jq -r '.requestId' "${marker}")"
+          payload_sha256="$(jq -r '.payloadSha256' "${marker}")"
+          if [[ "${release_kind}" == 'reviewed-main' ]]; then
+            [[ "${release_ref}" == 'refs/heads/main' ]]
+            [[ "${release_sha}" == "${trusted_main_sha}" ]]
+            [[ "${request_id}" =~ ^manual-[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$ ]]
+          elif [[ "${release_kind}" == 'cms' ]]; then
+            [[ "${release_ref}" =~ ^refs/heads/cms-release/[1-9][0-9]*-[1-9][0-9]*-[0-9a-f]{12}$ ]]
+            [[ "${release_ref}" == *"-${release_sha:0:12}" ]]
+            [[ "${request_id}" =~ ^cms-[1-9][0-9]*-[1-9][0-9]*$ ]]
+          else
+            echo 'Unsupported release kind in the public marker.' >&2
+            exit 1
+          fi
+
+          computed_payload="$(python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+
+          root = Path('.')
+          marker = '.well-known/dilijansff-release.json'
+          files = []
+          for path in root.rglob('*'):
+              if not path.is_file() or '.git' in path.parts:
+                  continue
+              relative = path.as_posix()
+              if relative == marker:
+                  continue
+              content = path.read_bytes()
+              files.append((relative, len(content), hashlib.sha256(content).hexdigest()))
+          digest = hashlib.sha256()
+          for relative, size, file_hash in sorted(files):
+              digest.update(relative.encode('utf-8'))
+              digest.update(b'\0')
+              digest.update(str(size).encode('ascii'))
+              digest.update(b'\0')
+              digest.update(file_hash.encode('ascii'))
+              digest.update(b'\0')
+          print(digest.hexdigest())
+          PY
+          )"
+          [[ "${computed_payload}" == "${payload_sha256}" ]]
+
+          echo "release_sha=${release_sha}" >> "${GITHUB_OUTPUT}"
+          echo "request_id=${request_id}" >> "${GITHUB_OUTPUT}"
+          echo "marker_sha256=$(sha256sum "${marker}" | awk '{print $1}')" >> "${GITHUB_OUTPUT}"
+          echo "index_sha256=$(sha256sum index.html | awk '{print $1}')" >> "${GITHUB_OUTPUT}"
+          echo "fbs_sha256=$(sha256sum fulfillment-fbs/index.html | awk '{print $1}')" >> "${GITHUB_OUTPUT}"
+
+      - name: Wait for this exact public commit's Pages deployment
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PUBLIC_SHA: ${{ github.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 600))
+          pages_completed='false'
+          while (( SECONDS < deadline )); do
+            workflow_runs="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/${GITHUB_REPOSITORY}/actions/runs?branch=main&event=dynamic&per_page=100")"
+            matching_runs="$(jq -c --arg sha "${PUBLIC_SHA}" '
+              [.workflow_runs[]
+                | select(.name == "pages build and deployment")
+                | select(.event == "dynamic")
+                | select(.head_branch == "main")
+                | select(.head_sha == $sha)]
+            ' <<< "${workflow_runs}")"
+            matching_count="$(jq -r 'length' <<< "${matching_runs}")"
+            [[ "${matching_count}" =~ ^[0-9]+$ ]]
+            if (( matching_count > 1 )); then
+              echo 'More than one Pages run matched the exact public commit.' >&2
+              exit 1
+            fi
+            if (( matching_count == 1 )); then
+              pages_status="$(jq -r '.[0].status' <<< "${matching_runs}")"
+              pages_conclusion="$(jq -r '.[0].conclusion // ""' <<< "${matching_runs}")"
+              if [[ "${pages_status}" == 'completed' ]]; then
+                [[ "${pages_conclusion}" == 'success' ]]
+                pages_completed='true'
+                break
+              fi
+            fi
+            sleep 10
+          done
+          [[ "${pages_completed}" == 'true' ]]
+
+      - name: Verify exact live hashes and HTTP smoke
+        env:
+          FBS_SHA256: ${{ steps.release.outputs.fbs_sha256 }}
+          INDEX_SHA256: ${{ steps.release.outputs.index_sha256 }}
+          MARKER_SHA256: ${{ steps.release.outputs.marker_sha256 }}
+          PUBLIC_SHA: ${{ github.sha }}
+          RELEASE_SHA: ${{ steps.release.outputs.release_sha }}
+          REQUEST_ID: ${{ steps.release.outputs.request_id }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          marker_file="${RUNNER_TEMP}/live-marker.json"
+          index_file="${RUNNER_TEMP}/live-index.html"
+          fbs_file="${RUNNER_TEMP}/live-fbs.html"
+          for _ in $(seq 1 40); do
+            marker_ok='false'
+            index_ok='false'
+            fbs_ok='false'
+            if curl --fail --silent --show-error --location --compressed --max-time 20 \
+              -H 'Cache-Control: no-cache' \
+              "https://dilijansff.ru/.well-known/dilijansff-release.json?public=${PUBLIC_SHA}&release=${RELEASE_SHA}&request=${REQUEST_ID}" \
+              --output "${marker_file}"; then
+              [[ "$(sha256sum "${marker_file}" | awk '{print $1}')" == "${MARKER_SHA256}" ]] && marker_ok='true'
+            fi
+            if curl --fail --silent --show-error --location --compressed --max-time 20 \
+              -H 'Cache-Control: no-cache' \
+              "https://dilijansff.ru/?public=${PUBLIC_SHA}&release=${RELEASE_SHA}&request=${REQUEST_ID}" \
+              --output "${index_file}"; then
+              [[ "$(sha256sum "${index_file}" | awk '{print $1}')" == "${INDEX_SHA256}" ]] && index_ok='true'
+            fi
+            if curl --fail --silent --show-error --location --compressed --max-time 20 \
+              -H 'Cache-Control: no-cache' \
+              "https://dilijansff.ru/fulfillment-fbs/?public=${PUBLIC_SHA}&release=${RELEASE_SHA}&request=${REQUEST_ID}" \
+              --output "${fbs_file}"; then
+              [[ "$(sha256sum "${fbs_file}" | awk '{print $1}')" == "${FBS_SHA256}" ]] && fbs_ok='true'
+            fi
+            if [[ "${marker_ok}" == 'true' && "${index_ok}" == 'true' && "${fbs_ok}" == 'true' ]]; then
+              break
+            fi
+            sleep 15
+          done
+          [[ "${marker_ok}" == 'true' && "${index_ok}" == 'true' && "${fbs_ok}" == 'true' ]]
+          cmp --silent .well-known/dilijansff-release.json "${marker_file}"
+          grep -Fq 'data-parity-id="page.fbs-service"' "${fbs_file}"
+          grep -Fq '<link rel="canonical" href="https://dilijansff.ru/fulfillment-fbs/">' "${fbs_file}"
+
+          mapfile -t assets < <(grep -Eo '(href|src)="/assets/(css|js)/[^"?]+\.(css|js)' "${fbs_file}" \
+            | sed -E 's/^(href|src)="//' | sort -u)
+          [[ "${#assets[@]}" -ge 2 ]]
+          live_asset="${RUNNER_TEMP}/live-asset"
+          for asset in "${assets[@]}"; do
+            test -f ".${asset}"
+            curl --fail --silent --show-error --location --compressed --max-time 20 \
+              -H 'Cache-Control: no-cache' \
+              "https://dilijansff.ru${asset}?public=${PUBLIC_SHA}" \
+              --output "${live_asset}"
+            cmp --silent ".${asset}" "${live_asset}"
+          done
+          remote_main="$(git ls-remote --exit-code "https://github.com/${GITHUB_REPOSITORY}.git" refs/heads/main | awk '{print $1}')"
+          [[ "${remote_main}" == "${PUBLIC_SHA}" ]]
+          echo "Verified public ${PUBLIC_SHA}, source ${RELEASE_SHA}, exact live marker/index/FBS/assets."
