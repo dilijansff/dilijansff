@@ -27,8 +27,9 @@ jobs:
           [[ "${PAGES_HEAD_SHA}" =~ ^[0-9a-f]{40}$ ]]
 
           deadline=$((SECONDS + 600))
-          pages_run_id=''
+          matching_runs='[]'
           pages_completed='false'
+          stable_signature=''
           while (( SECONDS < deadline )); do
             workflow_runs="$(gh api \
               -H 'Accept: application/vnd.github+json' \
@@ -43,47 +44,60 @@ jobs:
             ' <<< "${workflow_runs}")"
             matching_count="$(jq -r 'length' <<< "${matching_runs}")"
             [[ "${matching_count}" =~ ^[0-9]+$ ]]
-            if (( matching_count > 1 )); then
-              echo 'More than one Pages run matched the exact public commit.' >&2
-              exit 1
-            fi
-            if (( matching_count == 1 )); then
-              pages_run_id="$(jq -r '.[0].id' <<< "${matching_runs}")"
-              pages_status="$(jq -r '.[0].status' <<< "${matching_runs}")"
-              pages_conclusion="$(jq -r '.[0].conclusion // ""' <<< "${matching_runs}")"
-              [[ "${pages_run_id}" =~ ^[1-9][0-9]*$ ]]
-              if [[ "${pages_status}" == 'completed' ]]; then
-                [[ "${pages_conclusion}" == 'success' ]]
+            successful_count="$(jq -r '[.[] | select(.status == "completed" and .conclusion == "success")] | length' \
+              <<< "${matching_runs}")"
+            pending_count="$(jq -r '[.[] | select(.status != "completed")] | length' <<< "${matching_runs}")"
+            [[ "${successful_count}" =~ ^[0-9]+$ ]]
+            [[ "${pending_count}" =~ ^[0-9]+$ ]]
+            if (( successful_count > 0 && pending_count == 0 )); then
+              current_signature="$(jq -r '[.[].id] | sort | map(tostring) | join(",")' <<< "${matching_runs}")"
+              [[ -n "${current_signature}" ]]
+              if [[ "${current_signature}" == "${stable_signature}" ]]; then
                 pages_completed='true'
                 break
               fi
+              stable_signature="${current_signature}"
+            else
+              stable_signature=''
             fi
             sleep 10
           done
-          [[ "${pages_run_id}" =~ ^[1-9][0-9]*$ ]]
           [[ "${pages_completed}" == 'true' ]]
 
-          artifacts="$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${pages_run_id}/artifacts?per_page=100")"
-          artifact_count="$(jq -r '[.artifacts[] | select(.name == "github-pages")] | length' <<< "${artifacts}")"
-          [[ "${artifact_count}" == '1' ]]
-          artifact_id="$(jq -r --arg sha "${PAGES_HEAD_SHA}" --argjson run_id "${pages_run_id}" '
-            .artifacts[]
-            | select(.name == "github-pages")
-            | select(.workflow_run.id == $run_id)
-            | select(.workflow_run.head_sha == $sha)
-            | .id
-          ' <<< "${artifacts}")"
-          [[ "${artifact_id}" =~ ^[1-9][0-9]*$ ]]
-          gh api --method DELETE \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
-          remaining="$(gh api \
-            -H 'Accept: application/vnd.github+json' \
-            -H 'X-GitHub-Api-Version: 2022-11-28' \
-            "repos/${GITHUB_REPOSITORY}/actions/runs/${pages_run_id}/artifacts?per_page=100" \
-            --jq '[.artifacts[] | select(.name == "github-pages")] | length')"
-          [[ "${remaining}" == '0' ]]
+          while IFS=$'\t' read -r pages_run_id pages_conclusion; do
+            [[ "${pages_run_id}" =~ ^[1-9][0-9]*$ ]]
+            case "${pages_conclusion}" in
+              success|failure|neutral|cancelled|skipped|timed_out|action_required|stale|startup_failure) ;;
+              *) echo 'Completed exact-SHA Pages run has an unsupported conclusion.' >&2; exit 1 ;;
+            esac
+            artifacts="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${pages_run_id}/artifacts?per_page=100")"
+            artifact_count="$(jq -r '[.artifacts[] | select(.name == "github-pages")] | length' <<< "${artifacts}")"
+            [[ "${artifact_count}" =~ ^[0-9]+$ ]]
+            (( artifact_count <= 1 ))
+            if [[ "${pages_conclusion}" == 'success' ]]; then
+              [[ "${artifact_count}" == '1' ]]
+            fi
+            if (( artifact_count == 1 )); then
+              artifact_id="$(jq -r --arg sha "${PAGES_HEAD_SHA}" --argjson run_id "${pages_run_id}" '
+                .artifacts[]
+                | select(.name == "github-pages")
+                | select(.workflow_run.id == $run_id)
+                | select(.workflow_run.head_sha == $sha)
+                | .id
+              ' <<< "${artifacts}")"
+              [[ "${artifact_id}" =~ ^[1-9][0-9]*$ ]]
+              gh api --method DELETE \
+                -H 'Accept: application/vnd.github+json' \
+                -H 'X-GitHub-Api-Version: 2022-11-28' \
+                "repos/${GITHUB_REPOSITORY}/actions/artifacts/${artifact_id}"
+            fi
+            remaining="$(gh api \
+              -H 'Accept: application/vnd.github+json' \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "repos/${GITHUB_REPOSITORY}/actions/runs/${pages_run_id}/artifacts?per_page=100" \
+              --jq '[.artifacts[] | select(.name == "github-pages")] | length')"
+            [[ "${remaining}" == '0' ]]
+          done < <(jq -r '.[] | [.id, .conclusion] | @tsv' <<< "${matching_runs}")
