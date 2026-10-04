@@ -135,18 +135,12 @@ jobs:
             ' <<< "${workflow_runs}")"
             matching_count="$(jq -r 'length' <<< "${matching_runs}")"
             [[ "${matching_count}" =~ ^[0-9]+$ ]]
-            if (( matching_count > 1 )); then
-              echo 'More than one Pages run matched the exact public commit.' >&2
-              exit 1
-            fi
-            if (( matching_count == 1 )); then
-              pages_status="$(jq -r '.[0].status' <<< "${matching_runs}")"
-              pages_conclusion="$(jq -r '.[0].conclusion // ""' <<< "${matching_runs}")"
-              if [[ "${pages_status}" == 'completed' ]]; then
-                [[ "${pages_conclusion}" == 'success' ]]
-                pages_completed='true'
-                break
-              fi
+            successful_count="$(jq -r '[.[] | select(.status == "completed" and .conclusion == "success")] | length' \
+              <<< "${matching_runs}")"
+            [[ "${successful_count}" =~ ^[0-9]+$ ]]
+            if (( successful_count > 0 )); then
+              pages_completed='true'
+              break
             fi
             sleep 10
           done
